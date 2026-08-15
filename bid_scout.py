@@ -7,6 +7,7 @@
 import smtplib
 import os
 import re
+import time
 import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -34,64 +35,64 @@ HEADERS = {
 
 
 # ========== 搜索：中国政府采购网 ==========
-def search_ccgp(keyword):
-    """通过中国政府采购网搜索页面获取招标信息"""
+def search_ccgp(keyword, max_retries=3):
+    """通过中国政府采购网搜索页面获取招标信息（带重试）"""
     results = []
-    try:
-        url = "http://search.ccgp.gov.cn/bxsearch"
-        params = {
-            "searchtype": "1",
-            "kw": keyword,
-            "pageNo": "1",
-            "pageSize": "20",
-            "bidSort": "0",
-            "pinMu": "0",
-            "pinMuSS": "0",
-            "bidType": "1",
-            "gpClass": "0",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
+    url = "http://search.ccgp.gov.cn/bxsearch"
+    params = {
+        "searchtype": "1",
+        "kw": keyword,
+        "pageNo": "1",
+        "pageSize": "20",
+        "bidSort": "0",
+        "pinMu": "0",
+        "pinMuSS": "0",
+        "bidType": "1",
+        "gpClass": "0",
+    }
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        # CCGP 搜索结果列表选择器
-        items = soup.select("ul.vT-srch-result-list-bid li")
+            # CCGP 搜索结果列表选择器
+            items = soup.select("ul.vT-srch-result-list-bid li")
 
-        for item in items:
-            # 标题在 <a> 标签中
-            a_tag = item.find("a")
-            if not a_tag:
-                continue
-            title = a_tag.get_text(strip=True)
-            link = a_tag.get("href", "")
-            if link and not link.startswith("http"):
-                link = "http://www.ccgp.gov.cn" + link
+            for item in items:
+                a_tag = item.find("a")
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(strip=True)
+                link = a_tag.get("href", "")
+                if link and not link.startswith("http"):
+                    link = "http://www.ccgp.gov.cn" + link
 
-            # 从 URL 中提取发布日期（如 t20260814_27133140.htm）
-            date = ""
-            date_match = re.search(r"t(\d{4})(\d{2})(\d{2})", link)
-            if date_match:
-                date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                # 从 URL 中提取发布日期
+                date = ""
+                date_match = re.search(r"t(\d{4})(\d{2})(\d{2})", link)
+                if date_match:
+                    date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
 
-            # 从摘要中提取截止日期
-            full_text = item.get_text()
-            deadline = extract_deadline(full_text)
+                full_text = item.get_text()
+                deadline = extract_deadline(full_text)
+                budget = extract_budget(full_text)
 
-            # 从摘要中提取预算金额
-            budget = extract_budget(full_text)
-
-            if title:
-                results.append({
-                    "title": title,
-                    "source": "中国政府采购网",
-                    "link": link,
-                    "deadline": deadline,
-                    "budget": budget,
-                    "date": date,
-                    "full_text": full_text[:200],
-                })
-    except Exception as e:
-        print(f"  CCGP搜索 '{keyword}' 出错: {e}")
+                if title:
+                    results.append({
+                        "title": title,
+                        "source": "中国政府采购网",
+                        "link": link,
+                        "deadline": deadline,
+                        "budget": budget,
+                        "date": date,
+                        "full_text": full_text[:200],
+                    })
+            break  # 成功就跳出重试
+        except Exception as e:
+            print(f"  CCGP搜索 '{keyword}' 第{attempt}次出错: {e}")
+            if attempt < max_retries:
+                time.sleep(5)
     return results
 
 
