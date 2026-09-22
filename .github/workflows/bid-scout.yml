@@ -1,12 +1,7 @@
 name: 招标商机快报
 
 on:
-  schedule:
-    # 每天北京时间 9:00 和 9:05 两个时间点触发（UTC 1:00 和 1:05）
-    # 双时间点保证至少一个能触发（GitHub Actions 免费版 cron 不保证准时）
-    - cron: '0 1 * * *'
-    - cron: '5 1 * * *'
-  # 支持手动触发
+  # 由 cron-job.org 每天北京时间 9:00 精准触发 workflow_dispatch
   workflow_dispatch:
 
 jobs:
