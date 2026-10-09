@@ -24,8 +24,10 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "891329001@qq.com")
 REGION = "江西"
 # 搜索关键词（会在 CCGP 上逐个搜索）
 KEYWORDS = ["洗涤", "布草洗涤", "织物洗涤", "洗涤服务"]
-# 地区关键词（用于从全国结果中筛选江西相关）
+# 地区关键词（严格筛选：只有命中这些关键词的才算江西）
 REGION_KEYWORDS = ["江西", "南昌", "景德镇", "萍乡", "九江", "新余", "鹰潭", "赣州", "吉安", "宜春", "抚州", "上饶"]
+# 只推送最近 N 天内发布的信息（避免陈年旧公告）
+MAX_AGE_DAYS = 30
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -137,44 +139,17 @@ def is_region_related(item):
     return False
 
 
-# ========== 搜索：百度搜索（兜底方案）==========
-def search_baidu(keyword):
-    """通过百度搜索获取招标信息（兜底）"""
-    results = []
-    query = f"江西 {keyword} 招标公告 2026"
+def is_fresh(item, max_age_days=MAX_AGE_DAYS):
+    """判断发布日期是否在最近 N 天内（无日期的默认保留）"""
+    date_str = item.get("date", "")
+    if not date_str:
+        return True
     try:
-        url = f"https://www.baidu.com/s?wd={requests.utils.quote(query)}&rn=20"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 百度搜索结果可能在多种容器中
-        items = soup.select(".result") or soup.select("div.c-container") or soup.select("[tpl]")
-
-        for item in items:
-            # 标题在 h3 a 中
-            h3 = item.select_one("h3 a")
-            if not h3:
-                # 尝试其他方式
-                a = item.find("a")
-                if not a:
-                    continue
-                h3 = a
-            title = h3.get_text(strip=True)
-            link = h3.get("href", "")
-            if title and ("洗涤" in title or keyword in title):
-                results.append({
-                    "title": title,
-                    "source": "百度搜索",
-                    "link": link,
-                    "deadline": "",
-                    "budget": "",
-                    "date": "",
-                    "full_text": "",
-                })
-    except Exception as e:
-        print(f"  百度搜索出错: {e}")
-    return results
+        pub_date = datetime.strptime(date_str, "%Y-%m-%d")
+        age_days = (datetime.now() - pub_date).days
+        return age_days <= max_age_days
+    except ValueError:
+        return True
 
 
 # ========== 去重合并 ==========
@@ -221,10 +196,10 @@ body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color
 {deadline_html}
 <div class="card-meta">{source_info}{budget_info}{date_info} | {link_html}</div></div>"""
     else:
-        html += '<div class="card"><div class="card-title" style="color:#64748b;">今日暂无新增进行中的洗涤相关招标商机</div></div>'
+        html += '<div class="card"><div class="card-title" style="color:#64748b;">今日暂无新增的江西洗涤相关招标商机</div><div class="card-meta">已按「仅江西、最近30天」严格筛选，无匹配结果时不推送外地信息</div></div>'
     html += f"""<div class="footer">
 由「招标商机快报」自动生成 | 数据来源：中国政府采购网<br>
-运行环境：GitHub Actions 云端 | 如需调整关键词或频率请修改配置</div></div></body></html>"""
+筛选条件：仅江西地区 + 最近{MAX_AGE_DAYS}天 | 运行环境：GitHub Actions 云端</div></div></body></html>"""
     return html
 
 
@@ -264,22 +239,14 @@ def main():
     all_results = merge_results(all_results)
     print(f"\n  去重后共 {len(all_results)} 条全国结果")
 
-    # 筛选江西相关
-    jiangxi_results = [r for r in all_results if is_region_related(r)]
-    print(f"  筛选江西相关: {len(jiangxi_results)} 条")
+    # 筛选江西相关 + 最近30天内发布
+    jiangxi_results = [r for r in all_results if is_region_related(r) and is_fresh(r)]
+    print(f"  筛选江西相关且{MAX_AGE_DAYS}天内: {len(jiangxi_results)} 条")
     for r in jiangxi_results:
         print(f"    - {r['title'][:50]}")
 
-    # 如果 CCGP 搜索不到江西结果，保留全部结果（避免空邮件）
-    active_results = jiangxi_results if jiangxi_results else all_results[:5]
-
-    # 如果还是空，使用百度兜底
-    if not active_results:
-        print("\n[2] CCGP 无结果，使用百度搜索兜底...")
-        for kw in KEYWORDS[:2]:
-            baidu_results = search_baidu(kw)
-            active_results.extend(baidu_results)
-            print(f"  百度关键词 '{kw}' 找到 {len(baidu_results)} 条")
+    # 严格模式：只推江西，没有就发空报（不发外地信息）
+    active_results = jiangxi_results
 
     # 所有结果都算新增（GitHub Actions 无状态）
     new_count = len(active_results)
