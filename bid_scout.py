@@ -8,6 +8,7 @@ import smtplib
 import os
 import re
 import time
+import json
 import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -24,6 +25,10 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "891329001@qq.com")
 REGION = "江西"
 # 搜索关键词（会在 CCGP 上逐个搜索）
 KEYWORDS = ["洗涤", "布草洗涤", "织物洗涤", "洗涤服务"]
+# 江西公共资源交易网关键词
+JX_KEYWORDS = ["洗涤", "布草洗涤", "织物洗涤"]
+# 公告类型排除（已结束/非招标类不推）
+EXCLUDE_CATEGORIES = ["结果公示", "成交公示", "合同公示", "废标公告", "流标公告"]
 # 地区关键词（严格筛选：只有命中这些关键词的才算江西）
 REGION_KEYWORDS = ["江西", "南昌", "景德镇", "萍乡", "九江", "新余", "鹰潭", "赣州", "吉安", "宜春", "抚州", "上饶"]
 # 只推送最近 N 天内发布的信息（避免陈年旧公告）
@@ -34,6 +39,101 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
+
+JX_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "http://ggzy.jiangxi.gov.cn",
+    "Referer": "http://ggzy.jiangxi.gov.cn/jyxx/trade.html",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+JX_API = "http://ggzy.jiangxi.gov.cn/XZinterface/rest/esinteligentsearch/getFullTextDataNew"
+
+
+def search_jx_api(keyword, max_pages=2):
+    """搜索江西省公共资源交易网全文检索接口（分页取前几页）"""
+    results = []
+    seen_ids = set()
+    for pg in range(max_pages):
+        title_cond = {
+            "fieldName": "titlenew",
+            "equal": keyword,
+            "notEqual": None,
+            "equalList": None,
+            "notEqualList": None,
+            "isLike": True,
+            "likeType": 0,
+        }
+        param = {
+            "token": "",
+            "pn": pg * 20,
+            "rn": 20,
+            "sdt": "",
+            "edt": "",
+            "wd": "",
+            "inc_wd": "",
+            "exc_wd": "",
+            "fields": "",
+            "cnum": "",
+            "sort": '{"webdate":"0","id":"0"}',
+            "ssort": "",
+            "cl": 500,
+            "terminal": "",
+            "condition": [title_cond],
+            "unionCondition": [],
+            "time": [],
+            "highlights": "title",
+            "statistics": None,
+            "accuracy": "100",
+            "noParticiple": "0",
+            "searchrange": None,
+            "isBusiness": "1",
+        }
+        try:
+            resp = requests.post(JX_API, json=param, headers=JX_API_HEADERS, timeout=30)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            result = data.get("result", "")
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except Exception:
+                    break
+            records = result.get("records", []) if isinstance(result, dict) else []
+            for rec in records:
+                rid = rec.get("id") or rec.get("syscollectguid") or rec.get("infoid")
+                if rid and rid in seen_ids:
+                    continue
+                if rid:
+                    seen_ids.add(rid)
+                title = rec.get("titlenew") or rec.get("title") or ""
+                webdate = rec.get("webdate") or rec.get("infodate") or ""
+                link = rec.get("linkurl") or ""
+                if link and not link.startswith("http"):
+                    link = "http://ggzy.jiangxi.gov.cn" + link
+                content = rec.get("content") or ""
+                full_text = (title + " " + content)[:500]
+                results.append({
+                    "title": title,
+                    "source": "江西公共资源交易网",
+                    "link": link,
+                    "deadline": extract_deadline(full_text),
+                    "budget": extract_budget(full_text),
+                    "date": webdate[:10] if webdate else "",
+                    "full_text": full_text,
+                    "category": rec.get("categoryname") or "",
+                })
+            if len(records) < 20:
+                break
+        except Exception as e:
+            print(f"  江西交易网搜索 '{keyword}' 第{pg+1}页出错: {e}")
+            break
+        time.sleep(0.5)
+    return results
+
 
 
 # ========== 搜索：中国政府采购网 ==========
@@ -139,6 +239,49 @@ def is_region_related(item):
     return False
 
 
+def is_active_bid(item):
+    """判断是否为进行中的招标公告（剔除结果/废标/合同等）"""
+    cat = item.get("category", "")
+    if cat:
+        for exc in EXCLUDE_CATEGORIES:
+            if exc in cat:
+                return False
+    # 标题含明显结束标记也剔除
+    title = item.get("title", "")
+    for exc in ["废标", "流标", "结果公告", "中标公示", "成交结果"]:
+        if exc in title:
+            return False
+    # 截止日期已过的剔除（有截止日期才校验）
+    deadline = item.get("deadline", "")
+    if deadline:
+        dl = parse_deadline(deadline)
+        if dl and dl < datetime.now():
+            return False
+    return True
+
+
+def parse_deadline(text):
+    """解析截止时间字符串为 datetime（支持常见中文/数字格式）"""
+    patterns = [
+        r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2})\s*[点:：]\s*(\d{1,2})',
+        r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
+        r'(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})',
+        r'(\d{4})-(\d{2})-(\d{2})',
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            g = m.groups()
+            try:
+                if len(g) == 5:
+                    return datetime(int(g[0]), int(g[1]), int(g[2]), int(g[3]), int(g[4]))
+                elif len(g) == 3:
+                    return datetime(int(g[0]), int(g[1]), int(g[2]))
+            except ValueError:
+                return None
+    return None
+
+
 def is_fresh(item, max_age_days=MAX_AGE_DAYS):
     """判断发布日期是否在最近 N 天内（无日期的默认保留）"""
     date_str = item.get("date", "")
@@ -153,15 +296,36 @@ def is_fresh(item, max_age_days=MAX_AGE_DAYS):
 
 
 # ========== 去重合并 ==========
+def normalize_title(title):
+    """标题规范化：去空格/标点，便于比对"""
+    return re.sub(r'[\s（）()【】\[\]：:，,。.、-]', '', title or "")
+
+
+def extract_project_no(title):
+    """从标题提取项目编号（如 JXTC2026040477C1）"""
+    m = re.search(r'[A-Za-z]{2,}\d{4,}[A-Za-z0-9\-]*', title or "")
+    return m.group(0).upper() if m else ""
+
+
 def merge_results(all_results):
     seen_keys = set()
+    seen_nos = set()
     merged = []
     for item in all_results:
         # 用标题去重（去除空格和标点）
-        key = re.sub(r'[\s（）()【】\[\]【】]', '', item["title"])
-        if key not in seen_keys:
-            seen_keys.add(key)
-            merged.append(item)
+        key = normalize_title(item["title"])
+        title_no = extract_project_no(item["title"])
+        dup = False
+        if key in seen_keys:
+            dup = True
+        elif title_no and title_no in seen_nos:
+            dup = True
+        if dup:
+            continue
+        seen_keys.add(key)
+        if title_no:
+            seen_nos.add(title_no)
+        merged.append(item)
     return merged
 
 
@@ -235,13 +399,23 @@ def main():
         all_results.extend(results)
         print(f"  关键词 '{kw}' 找到 {len(results)} 条")
 
+    # 第二步：搜索江西省公共资源交易网
+    print("\n[2] 搜索江西公共资源交易网...")
+    jx_count = 0
+    for kw in JX_KEYWORDS:
+        results = search_jx_api(kw)
+        all_results.extend(results)
+        jx_count += len(results)
+        print(f"  关键词 '{kw}' 找到 {len(results)} 条")
+    print(f"  江西交易网合计 {jx_count} 条")
+
     # 去重
     all_results = merge_results(all_results)
     print(f"\n  去重后共 {len(all_results)} 条全国结果")
 
-    # 筛选江西相关 + 最近30天内发布
-    jiangxi_results = [r for r in all_results if is_region_related(r) and is_fresh(r)]
-    print(f"  筛选江西相关且{MAX_AGE_DAYS}天内: {len(jiangxi_results)} 条")
+    # 筛选江西相关 + 最近30天内发布 + 进行中招标
+    jiangxi_results = [r for r in all_results if is_region_related(r) and is_fresh(r) and is_active_bid(r)]
+    print(f"  筛选江西相关且{MAX_AGE_DAYS}天内进行中: {len(jiangxi_results)} 条")
     for r in jiangxi_results:
         print(f"    - {r['title'][:50]}")
 
