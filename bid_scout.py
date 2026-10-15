@@ -43,16 +43,22 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-JX_API_HEADERS = {
+# 全国公共资源交易平台（海外可达，作为江西交易网替代数据源）
+GGZY_API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Origin": "http://ggzy.jiangxi.gov.cn",
-    "Referer": "http://ggzy.jiangxi.gov.cn/jyxx/trade.html",
-    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Origin": "https://www.ggzy.gov.cn",
+    "Referer": "https://www.ggzy.gov.cn/deal/dealList.html",
+    "X-Pass-Token": "",
 }
 
-JX_API = "https://ggzy.jiangxi.gov.cn/XZinterface/rest/esinteligentsearch/getFullTextDataNew"
+GGZY_API = "https://www.ggzy.gov.cn/information/pubTradingInfo/getTradList"
+# 江西省份代码
+GGZY_PROVINCE_JX = "360000"
+# 近一月时间选项
+GGZY_DEAL_TIME_MONTH = "04"
+# 信息类型：0201=采购/资审公告（保留），0202=中标公告（剔除）
+GGZY_KEEP_INFO_TYPES = ["0201"]
 
 
 class LegacySSLAdapter(HTTPAdapter):
@@ -81,87 +87,63 @@ class LegacySSLAdapter(HTTPAdapter):
         return super().proxy_manager_for(*args, **kwargs)
 
 
-def search_jx_api(keyword, max_pages=2):
-    """搜索江西省公共资源交易网全文检索接口（分页取前几页）"""
+def search_ggzy(keyword, max_pages=2):
+    """搜索全国公共资源交易平台（限定江西 + 近一月），海外 GitHub Actions 可达"""
     results = []
     seen_ids = set()
-    session = requests.Session()
-    session.mount("https://", LegacySSLAdapter())
-    session.mount("http://", LegacySSLAdapter())
-    for pg in range(max_pages):
-        title_cond = {
-            "fieldName": "titlenew",
-            "equal": keyword,
-            "notEqual": None,
-            "equalList": None,
-            "notEqualList": None,
-            "isLike": True,
-            "likeType": 0,
-        }
-        param = {
-            "token": "",
-            "pn": pg * 20,
-            "rn": 20,
-            "sdt": "",
-            "edt": "",
-            "wd": "",
-            "inc_wd": "",
-            "exc_wd": "",
-            "fields": "",
-            "cnum": "",
-            "sort": '{"webdate":"0","id":"0"}',
-            "ssort": "",
-            "cl": 500,
-            "terminal": "",
-            "condition": [title_cond],
-            "unionCondition": [],
-            "time": [],
-            "highlights": "title",
-            "statistics": None,
-            "accuracy": "100",
-            "noParticiple": "0",
-            "searchrange": None,
-            "isBusiness": "1",
+    for pg in range(1, max_pages + 1):
+        form = {
+            "DEAL_PROVINCE": GGZY_PROVINCE_JX,   # 江西
+            "FINDTXT": keyword,                  # 关键词
+            "DEAL_TIME": GGZY_DEAL_TIME_MONTH,   # 近一月
+            "PAGENUMBER": str(pg),
         }
         try:
-            resp = session.post(JX_API, json=param, headers=JX_API_HEADERS, timeout=30)
+            resp = requests.post(GGZY_API, data=form, headers=GGZY_API_HEADERS, timeout=30)
             if resp.status_code != 200:
+                print(f"  GGZY搜索 '{keyword}' 第{pg}页 HTTP {resp.status_code}")
                 break
             data = resp.json()
-            result = data.get("result", "")
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except Exception:
-                    break
-            records = result.get("records", []) if isinstance(result, dict) else []
+            if data.get("code") != 200:
+                print(f"  GGZY搜索 '{keyword}' 第{pg}页 code={data.get('code')} msg={data.get('message')}")
+                break
+            d = data.get("data", {})
+            records = d.get("records", [])
             for rec in records:
-                rid = rec.get("id") or rec.get("syscollectguid") or rec.get("infoid")
+                rid = rec.get("id", "")
                 if rid and rid in seen_ids:
                     continue
                 if rid:
                     seen_ids.add(rid)
-                title = rec.get("titlenew") or rec.get("title") or ""
-                webdate = rec.get("webdate") or rec.get("infodate") or ""
-                link = rec.get("linkurl") or ""
+                title = rec.get("title", "") or ""
+                webdate = rec.get("publishTime", "") or ""
+                link = rec.get("url", "") or ""
                 if link and not link.startswith("http"):
-                    link = "https://ggzy.jiangxi.gov.cn" + link
-                content = rec.get("content") or ""
-                full_text = (title + " " + content)[:500]
+                    link = "https://www.ggzy.gov.cn" + link
+                info_type = rec.get("informationType", "") or ""
+                info_type_text = rec.get("informationTypeText", "") or ""
+                platform = rec.get("transactionSourcesPlatformText", "") or ""
+                # 只保留采购/资审公告类型（0201），剔除中标/结果等
+                if info_type not in GGZY_KEEP_INFO_TYPES:
+                    continue
                 results.append({
                     "title": title,
-                    "source": "江西公共资源交易网",
+                    "source": "全国公共资源交易平台",
                     "link": link,
-                    "deadline": extract_deadline(full_text),
-                    "budget": extract_budget(full_text),
+                    "deadline": "",
+                    "budget": "",
                     "date": webdate[:10] if webdate else "",
-                    "full_text": full_text,
-                    "category": rec.get("categoryname") or "",
+                    "full_text": title,
+                    "category": info_type_text,
+                    "platform": platform,
+                    "region_verified": True,  # 平台已按江西省份筛选，跳过地区关键词检查
                 })
+            total = d.get("total", 0)
+            print(f"  关键词 '{keyword}' 第{pg}页: 返回 {len(records)} 条, 保留 {sum(1 for _ in results if _['date'])}, 总 {total} 条")
             if len(records) < 20:
                 break
         except Exception as e:
-            print(f"  江西交易网搜索 '{keyword}' 第{pg+1}页出错: {e}")
+            print(f"  GGZY搜索 '{keyword}' 第{pg}页出错: {e}")
             break
         time.sleep(0.5)
     return results
@@ -263,7 +245,9 @@ def extract_budget(text):
 
 
 def is_region_related(item):
-    """判断是否与江西相关"""
+    """判断是否与江西相关（全国平台已按省份筛选，直接通过）"""
+    if item.get("region_verified"):
+        return True
     text = item.get("title", "") + item.get("full_text", "")
     for kw in REGION_KEYWORDS:
         if kw in text:
@@ -272,15 +256,15 @@ def is_region_related(item):
 
 
 def is_active_bid(item):
-    """判断是否为进行中的招标公告（剔除结果/废标/合同等）"""
+    """判断是否为进行中的招标公告（剔除结果/废标/合同/更正等）"""
     cat = item.get("category", "")
     if cat:
         for exc in EXCLUDE_CATEGORIES:
             if exc in cat:
                 return False
-    # 标题含明显结束标记也剔除
+    # 标题含明显结束/变更标记也剔除
     title = item.get("title", "")
-    for exc in ["废标", "流标", "结果公告", "中标公示", "成交结果"]:
+    for exc in ["废标", "流标", "结果公告", "结果公示", "中标公示", "成交结果", "更正公告", "变更公告", "澄清公告", "终止公告", "暂停公告"]:
         if exc in title:
             return False
     # 截止日期已过的剔除（有截止日期才校验）
@@ -394,7 +378,7 @@ body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color
     else:
         html += '<div class="card"><div class="card-title" style="color:#64748b;">今日暂无新增的江西洗涤相关招标商机</div><div class="card-meta">已按「仅江西、最近30天」严格筛选，无匹配结果时不推送外地信息</div></div>'
     html += f"""<div class="footer">
-由「招标商机快报」自动生成 | 数据来源：中国政府采购网<br>
+由「招标商机快报」自动生成 | 数据来源：中国政府采购网 + 全国公共资源交易平台<br>
 筛选条件：仅江西地区 + 最近{MAX_AGE_DAYS}天 | 运行环境：GitHub Actions 云端</div></div></body></html>"""
     return html
 
@@ -431,15 +415,15 @@ def main():
         all_results.extend(results)
         print(f"  关键词 '{kw}' 找到 {len(results)} 条")
 
-    # 第二步：搜索江西省公共资源交易网
-    print("\n[2] 搜索江西公共资源交易网...")
+    # 第二步：搜索全国公共资源交易平台（江西+洗涤）
+    print("\n[2] 搜索全国公共资源交易平台（江西）...")
     jx_count = 0
     for kw in JX_KEYWORDS:
-        results = search_jx_api(kw)
+        results = search_ggzy(kw)
         all_results.extend(results)
         jx_count += len(results)
         print(f"  关键词 '{kw}' 找到 {len(results)} 条")
-    print(f"  江西交易网合计 {jx_count} 条")
+    print(f"  全国平台江西合计 {jx_count} 条")
 
     # 去重
     all_results = merge_results(all_results)
