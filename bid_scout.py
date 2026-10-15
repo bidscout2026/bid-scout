@@ -9,11 +9,14 @@ import os
 import re
 import time
 import json
+import ssl
 import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 
 # ========== 配置 ==========
 SMTP_SERVER = "smtp.qq.com"
@@ -49,13 +52,42 @@ JX_API_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-JX_API = "http://ggzy.jiangxi.gov.cn/XZinterface/rest/esinteligentsearch/getFullTextDataNew"
+JX_API = "https://ggzy.jiangxi.gov.cn/XZinterface/rest/esinteligentsearch/getFullTextDataNew"
+
+
+class LegacySSLAdapter(HTTPAdapter):
+    """适配使用旧版 TLS/SSL 的国内政务网站（允许不安全重协商）"""
+
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        except AttributeError:
+            pass
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        except AttributeError:
+            pass
+        kwargs["ssl_context"] = ctx
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 def search_jx_api(keyword, max_pages=2):
     """搜索江西省公共资源交易网全文检索接口（分页取前几页）"""
     results = []
     seen_ids = set()
+    session = requests.Session()
+    session.mount("https://", LegacySSLAdapter())
+    session.mount("http://", LegacySSLAdapter())
     for pg in range(max_pages):
         title_cond = {
             "fieldName": "titlenew",
@@ -92,7 +124,7 @@ def search_jx_api(keyword, max_pages=2):
             "isBusiness": "1",
         }
         try:
-            resp = requests.post(JX_API, json=param, headers=JX_API_HEADERS, timeout=30)
+            resp = session.post(JX_API, json=param, headers=JX_API_HEADERS, timeout=30)
             if resp.status_code != 200:
                 break
             data = resp.json()
@@ -113,7 +145,7 @@ def search_jx_api(keyword, max_pages=2):
                 webdate = rec.get("webdate") or rec.get("infodate") or ""
                 link = rec.get("linkurl") or ""
                 if link and not link.startswith("http"):
-                    link = "http://ggzy.jiangxi.gov.cn" + link
+                    link = "https://ggzy.jiangxi.gov.cn" + link
                 content = rec.get("content") or ""
                 full_text = (title + " " + content)[:500]
                 results.append({
